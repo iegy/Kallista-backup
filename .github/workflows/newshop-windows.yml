@@ -1,0 +1,90 @@
+name: NewShop Windows runtime verification
+
+on:
+  push:
+    branches:
+      - "codex/newshop-windows-build"
+
+jobs:
+  build-and-open-windows-x64:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract isolated NewShop source
+        shell: pwsh
+        run: Expand-Archive -LiteralPath NewShop-build-source.zip -DestinationPath newshop -Force
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: newshop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install locked dependencies
+        working-directory: newshop
+        run: npm ci
+      - name: TypeScript and JavaScript tests
+        working-directory: newshop
+        run: |
+          npm run typecheck
+          npm test
+      - name: Rust tests
+        working-directory: newshop
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          cargo test --manifest-path license-tool/Cargo.toml
+      - name: Build NSIS installer
+        working-directory: newshop
+        run: npm run tauri:build
+      - name: Build native license manager GUI
+        working-directory: newshop
+        run: cargo build --release --manifest-path license-tool/Cargo.toml
+      - name: Verify setup wizard, installation, app, and license manager windows
+        working-directory: newshop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nsis = (Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1).FullName
+          $setupUi = Start-Process -FilePath $nsis -PassThru
+          Start-Sleep -Seconds 4
+          if ($setupUi.HasExited) { throw "NSIS Setup exited before its wizard could be verified" }
+          $setupUi.Refresh()
+          if ($setupUi.MainWindowHandle -eq 0) { throw "NSIS Setup did not create a visible wizard window" }
+          Stop-Process -Id $setupUi.Id -Force
+
+          $install = Start-Process -FilePath $nsis -ArgumentList '/S' -PassThru -Wait
+          if ($install.ExitCode -ne 0) { throw "NSIS silent install failed with exit code $($install.ExitCode)" }
+
+          $installedExe = Join-Path $env:LOCALAPPDATA 'NewShop\NewShop.exe'
+          if (-not (Test-Path $installedExe)) { throw "Installed NewShop.exe was not found at $installedExe" }
+          $app = Start-Process -FilePath $installedExe -PassThru
+          Start-Sleep -Seconds 8
+          if ($app.HasExited) { throw "Installed NewShop exited before its window could be verified" }
+          $app.Refresh()
+          if ($app.MainWindowHandle -eq 0) { throw "Installed NewShop did not create a visible window" }
+          Stop-Process -Id $app.Id -Force
+
+          $managerPath = (Resolve-Path 'license-tool/target/release/NewShop-License-Manager.exe').Path
+          $manager = Start-Process -FilePath $managerPath -PassThru
+          Start-Sleep -Seconds 4
+          if ($manager.HasExited) { throw "License Manager exited before its GUI could be verified" }
+          $manager.Refresh()
+          if ($manager.MainWindowHandle -eq 0) { throw "License Manager did not create a visible window" }
+          Stop-Process -Id $manager.Id -Force
+      - name: Collect verified binaries
+        working-directory: newshop
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item (Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1).FullName "artifacts/NewShop-2.0.0-Setup-x64.exe"
+          Copy-Item "src-tauri/target/release/NewShop.exe" "artifacts/NewShop.exe"
+          Copy-Item "license-tool/target/release/NewShop-License-Manager.exe" "artifacts/NewShop-License-Manager.exe"
+          Get-FileHash artifacts/* -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NewShop-2.0.0-Windows-x64-fixed
+          path: newshop/artifacts/
+          if-no-files-found: error
